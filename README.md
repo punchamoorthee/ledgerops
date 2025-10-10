@@ -1,1 +1,2 @@
-# ledgerops
+# LedgerOps
+A high relaibility transactional ledger service designed for correctness under concurrent load and network faults, featuring production-grade observability and reproducible performance benchmarks.
