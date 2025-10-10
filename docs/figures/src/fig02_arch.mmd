@@ -1,0 +1,35 @@
+%%{init: {"theme":"neutral","themeVariables":{
+  "fontFamily":"Inter",
+  "primaryColor":"#40826D","primaryBorderColor":"#40826D","primaryTextColor":"#0a0a0a",
+  "lineColor":"#40826D","tertiaryColor":"#ffffff"}}}%%
+flowchart LR
+  %% Layers
+  subgraph Client
+    C([k6 / Client App])
+  end
+
+  subgraph Service["Service (Go API)"]
+    A(["API Service<br/>OpenAPI 3.1"])
+  end
+
+  subgraph Database
+    DB[(PostgreSQL)]
+    IDEM[[Idempotency Key Store]]
+  end
+
+  subgraph Observability
+    P([Prometheus])
+    G([Grafana])
+  end
+
+  %% Flows
+  C --|HTTP/JSON|--> A
+  A --|SQL: Read Committed + FOR UPDATE|--> DB
+  A --|Insert/Read by key|--> IDEM
+  P --|scrape/metrics|--> A
+  G --|query|--> P
+
+  %% Styling for legibility on white
+  class C,A,DB,IDEM,P,G accent;
+  classDef accent stroke:#40826D,stroke-width:2px,fill:#ffffff,color:#0a0a0a;
+  linkStyle default stroke:#40826D,stroke-width:2px;
