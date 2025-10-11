@@ -8,42 +8,23 @@ sequenceDiagram
   participant A as API (Go)
   participant D as PostgreSQL
 
-  Note over A,D: Txn: Read Committed + fixed lock order (debit → credit)
+  Note over A,D: Txn Read Committed and fixed lock order
+  Note over A,D: Sort account UUIDs ascending then lock
 
-  C->>A: POST /transfers (Idempotency-Key: K)
-  activate A
+  C->>A: POST /transfers (Idempotency-Key K)
   A->>D: BEGIN
-  activate D
-  A->>D: SELECT ... FOR UPDATE (debit)
-  A->>D: SELECT ... FOR UPDATE (credit)
-  A->>D: INSERT ledger_entries (+version)
+  A->>D: SELECT ... FOR UPDATE lock accounts asc
+  A->>D: INSERT into ledger_entries and bump version
+  A->>D: UPSERT idempotency_keys with K status=completed store response
   A->>D: COMMIT
-  deactivate D
-  A-->>C: 202 Accepted
-  Note over C,A: Location: /transfers/{id}
-  deactivate A
+  A-->>C: 200 OK result
 
-  loop Poll with backoff + jitter
-    C->>A: GET /transfers/{id}
-    alt Not completed yet
-      A-->>C: 202 Accepted
-    else Completed
-      A-->>C: 200 OK (result)
-    end
-  end
-
-  alt Lost response after COMMIT
-    Note over C,A: Client retries POST with same K
+  alt Retry with same K
     C->>A: POST /transfers (K)
-    A->>D: SELECT idempotency_keys WHERE key = K
-    alt status = completed
-      A-->>C: 200 OK (replay stored result)
-    else status = in_progress
-      A-->>C: 202 Accepted
-      Note over C,A: Location: /transfers/{id}
+    A->>D: SELECT * FROM idempotency_keys WHERE key=K
+    alt status is completed
+      A-->>C: 200 OK replay stored result
+    else status is in_progress
+      A-->>C: 409 Conflict
     end
-  end
-
-  alt Network timeout on POST/GET
-    Note over C: Unknown outcome → retry with K (exp backoff + jitter)
   end

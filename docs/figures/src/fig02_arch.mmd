@@ -5,31 +5,30 @@
 flowchart LR
   %% Layers
   subgraph Client
-    C([k6 / Client App])
+    C[k6 / Client App]
   end
 
-  subgraph Service["Service (Go API)"]
-    A(["API Service<br/>OpenAPI 3.1"])
+  subgraph Service
+    A["Go API Service<br/>OpenAPI 3.1"]
   end
 
-  subgraph Database
+  subgraph "Database (single instance)"
     DB[(PostgreSQL)]
-    IDEM[[Idempotency Key Store]]
+    IDEM[(idempotency_keys)]
   end
 
   subgraph Observability
-    P([Prometheus])
-    G([Grafana])
+    P[Prometheus]
+    G[Grafana]
   end
 
   %% Flows
-  C --|HTTP/JSON|--> A
-  A --|SQL: Read Committed + FOR UPDATE|--> DB
-  A --|Insert/Read by key|--> IDEM
-  P --|scrape/metrics|--> A
-  G --|query|--> P
+  C -- HTTP/JSON --> A
+  A -- "SQL: Read Committed<br/>SELECT ... FOR UPDATE" --> DB
+  A -- "Insert / Read by Idempotency-Key" --> IDEM
+  P -- "scrape /metrics" --> A
+  G -- query --> P
 
-  %% Styling for legibility on white
-  class C,A,DB,IDEM,P,G accent;
+  %% Styling
   classDef accent stroke:#40826D,stroke-width:2px,fill:#ffffff,color:#0a0a0a;
-  linkStyle default stroke:#40826D,stroke-width:2px;
+  class C,A,DB,IDEM,P,G accent;

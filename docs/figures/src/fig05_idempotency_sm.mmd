@@ -6,16 +6,11 @@ stateDiagram-v2
   direction LR
 
   [*] --> New
-  New --> In_Progress: POST(K) [!exists(K)]
-
-  In_Progress --> In_Progress: POST(K) [exists && in_progress] / 202 (poll)
-  In_Progress --> In_Progress: GET /transfers/{id} [in_progress] / 202
-  In_Progress --> Completed: process & commit
-
-  state "Replay" as Replay
-  Completed --> Replay: POST(K) [exists && completed]
-  Replay --> Completed: return stored result / 200
-
-  Completed --> Completed: GET /transfers/{id} [completed] / 200
-  Completed --> Completed: POST(K) [exists && completed] / 200
-  Completed --> [*]
+  New --> In_Progress: POST(K)<br/>!exists(K)
+  In_Progress --> In_Progress: GET /transfers/{id}<br/>returns 202
+  In_Progress --> Completed: process and commit<br/>store response
+  In_Progress --> In_Progress: POST(K)<br/>exists && in_progress → 409
+  Completed --> Completed: GET /transfers/{id}<br/>returns 200
+  Completed --> Completed: POST(K)<br/>exists && completed → 200 (replay)
+  Completed --> Expired: TTL elapsed
+  Expired --> [*]

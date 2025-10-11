@@ -7,6 +7,8 @@ erDiagram
     UUID id PK
     BIGINT balance_cents
     INT version
+    TIMESTAMPTZ created_at
+    TIMESTAMPTZ updated_at
   }
 
   LEDGER_ENTRIES {
@@ -18,9 +20,13 @@ erDiagram
   }
 
   IDEMPOTENCY_KEYS {
-    TEXT idempotency_key PK
+    UUID idempotency_key PK
     TEXT status
+    TEXT request_hash
+    INT response_status_code
+    BYTEA response_body
     TIMESTAMPTZ created_at
+    TIMESTAMPTZ expires_at
   }
 
   ACCOUNTS ||--o{ LEDGER_ENTRIES : debited_by
