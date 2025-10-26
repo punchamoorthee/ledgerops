@@ -1,0 +1,34 @@
+version: '3.8'
+services:
+  # SERVICE 1: The PostgreSQL Database
+  db:
+    image: postgres:18.0
+    container_name: ledger_db
+    restart: always
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=secret
+      - POSTGRES_DB=ledger
+    ports:
+      # Exposes the DB to the HOST machine (for DBeaver)
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # SERVICE 2: The Go API
+  api:
+    container_name: ledger_api
+    build: .
+    restart: always
+    ports:
+      # Exposes the API to the HOST machine (for Postman)
+      - '8080:8080'
+    depends_on:
+      - db # Tells Docker to start the 'db' service *before* this one
+    environment:
+      # This is how the Go app will find the database.
+      - DB_SOURCE=postgresql://admin:secret@db:5432/ledger?sslmode=disable
+
+# This defines a "named volume" to persist our DB data
+volumes:
+  postgres_data:
