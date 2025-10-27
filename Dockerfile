@@ -19,7 +19,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o /ledgerops_server ./cmd/api/
 
 # STAGE 2: Create the final, small image
-FROM 1.25.2:latest
+FROM golang:1.25.2
 
 WORKDIR /
 
