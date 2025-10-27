@@ -9,6 +9,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Global variable for the database connection pool
@@ -37,6 +38,9 @@ func main() {
 	r.HandleFunc("/healthz", HealthCheckHandler).Methods("GET")
 	r.HandleFunc("/accounts", CreateAccountHandler).Methods("POST")
 	r.HandleFunc("/transfers", CreateTransferHandler).Methods("POST")
+
+	// Prometheus
+	r.Handle("/metrics", promhttp.Handler()).Methods("GET")
 
 	// 4. Start the server
 	log.Println("Starting server on :8080")

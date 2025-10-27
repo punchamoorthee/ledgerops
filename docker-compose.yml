@@ -28,6 +28,29 @@ services:
       # This is how the Go app will find the database.
       - DB_SOURCE=postgresql://admin:secret@db:5432/ledger?sslmode=disable
 
+  # SERVICE 3: Prometheus (Metrics Collection)
+  prometheus:
+    image: prom/prometheus:v3.6.0
+    container_name: prometheus
+    restart: always
+    volumes:
+      # Mount the configuration file
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - '9090:9090'
+    depends_on:
+      - api
+
+  # SERVICE 4: Grafana (Metrics Dashboard)
+  grafana:
+    image: grafana/grafana:12.2.0
+    container_name: grafana
+    restart: always
+    ports:
+      - '3000:3000'
+    depends_on:
+      - prometheus
+
 # This defines a "named volume" to persist our DB data
 volumes:
   postgres_data:

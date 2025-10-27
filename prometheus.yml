@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 15s # How often to check for metrics
+
+scrape_configs:
+  - job_name: 'ledger-api'
+    static_configs:
+      # 'api:8080' is the Docker-internal address for the Go app
+      - targets: ['api:8080']
