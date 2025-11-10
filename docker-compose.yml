@@ -9,10 +9,27 @@ services:
       - POSTGRES_PASSWORD=secret
       - POSTGRES_DB=ledger
     ports:
-      # Exposes the DB to the HOST machine (for DBeaver)
       - '5432:5432'
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    # This command checks if the Postgres server is ready
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U admin -d ledger" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # SERVICE 1.5: The Migrator
+  migrate:
+    image: migrate/migrate:v4.17.1
+    container_name: ledger_migrator
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./db/migration:/migrations
+    # This command is hard-coded to avoid variable issues
+    command: [ "-path", "/migrations", "-database", "postgres://admin:secret@db:5432/ledger?sslmode=disable", "up" ]
 
   # SERVICE 2: The Go API
   api:
@@ -20,28 +37,25 @@ services:
     build: .
     restart: always
     ports:
-      # Exposes the API to the HOST machine (for Postman)
       - '8080:8080'
     depends_on:
-      - db # Tells Docker to start the 'db' service *before* this one
+      - migrate
     environment:
-      # This is how the Go app will find the database.
-      - DB_SOURCE=postgresql://admin:secret@db:5432/ledger?sslmode=disable
+      - DB_SOURCE=postgres://admin:secret@db:5432/ledger?sslmode=disable
 
-  # SERVICE 3: Prometheus (Metrics Collection)
+  # SERVICE 3: Prometheus
   prometheus:
     image: prom/prometheus:v3.6.0
     container_name: prometheus
     restart: always
     volumes:
-      # Mount the configuration file
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
       - '9090:9090'
     depends_on:
       - api
 
-  # SERVICE 4: Grafana (Metrics Dashboard)
+  # SERVICE 4: Grafana
   grafana:
     image: grafana/grafana:12.2.0
     container_name: grafana
@@ -51,6 +65,5 @@ services:
     depends_on:
       - prometheus
 
-# This defines a "named volume" to persist our DB data
 volumes:
   postgres_data:

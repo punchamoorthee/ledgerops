@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
 
 	"github.com/gorilla/mux"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -54,6 +57,20 @@ func HealthCheckHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
+// This helper centralizes error responses.
+func respondWithError(w http.ResponseWriter, code int, message string) {
+	respondWithJSON(w, code, map[string]string{"error": message})
+}
+
+// This helper centralizes all successful JSON responses.
+func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	if payload != nil {
+		json.NewEncoder(w).Encode(payload)
+	}
+}
+
 // CreateAccountHandler creates a new account with a zero balance
 func CreateAccountHandler(w http.ResponseWriter, r *http.Request) {
 	var accountID int64
@@ -78,44 +95,120 @@ type TransferRequest struct {
 	Amount        int64 `json:"amount"`
 }
 
-// CreateTransferHandler handles the core transfer logic
+// Represents the canonical successful response
+type TransferResponse struct {
+	TransferID    int64 `json:"transfer_id"`
+	FromAccountID int64 `json:"from_account_id"`
+	ToAccountID   int64 `json:"to_account_id"`
+	Amount        int64 `json:"amount"`
+}
+
+// CreateTransferHandler now wraps the core logic in an idempotent, atomic transaction.
 func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := context.Background()
+
+	// === IDEMPOTENCY (GATE) ===
+	// 1. Get the idempotency key from the header.
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if idempotencyKey == "" {
+		respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+
+	// 2. Parse the request body
 	var req TransferRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		respondWithError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	tx, err := db.Begin(context.Background())
+	// 3. Validate business rules
+	if req.Amount <= 0 {
+		respondWithError(w, http.StatusUnprocessableEntity, "Amount must be positive")
+		return
+	}
+	if req.FromAccountID == req.ToAccountID {
+		respondWithError(w, http.StatusUnprocessableEntity, "Cannot transfer to the same account")
+		return
+	}
+
+	// === ATOMIC TRANSACTION (BEGIN) ===
+	// 4. Begin a new transaction with REPEATABLE READ isolation
+	tx, err := db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 	if err != nil {
 		log.Printf("Failed to start transaction: %v\n", err)
-		http.Error(w, "Failed to start transaction", http.StatusInternalServerError)
+		respondWithError(w, http.StatusInternalServerError, "Failed to start transaction")
 		return
 	}
-	defer tx.Rollback(context.Background())
+	// Defer a rollback in case anything goes wrong.
+	defer tx.Rollback(ctx)
+
+	// 5. === IDEMPOTENCY (CHECK) ===
+	// Check if this key has already been processed.
+	var storedStatus int
+	var storedBody json.RawMessage // Use RawMessage to store the JSON bytes
+	err = tx.QueryRow(ctx,
+		"SELECT response_status, response_body FROM idempotency_keys WHERE key = $1",
+		idempotencyKey,
+	).Scan(&storedStatus, &storedBody)
+
+	if err == nil {
+		// Key FOUND. This is a replay.
+		log.Printf("Replaying idempotent request: %s", idempotencyKey)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK) // 200 OK for a successful replay
+		w.Write(storedBody)
+		return
+
+	} else if err != pgx.ErrNoRows {
+		// This was not a "not found" error, but a real database error.
+		log.Printf("Failed to query idempotency key: %v\n", err)
+		respondWithError(w, http.StatusInternalServerError, "Database error")
+		return
+	}
+
+	// 6. === IDEMPOTENCY (RECORD) ===
+	// Record the key as 'in_progress' to prevent a concurrent duplicate.
+	_, err = tx.Exec(ctx,
+		"INSERT INTO idempotency_keys (key, status) VALUES ($1, 'in_progress')",
+		idempotencyKey,
+	)
+	if err != nil {
+		// This handles a "race condition" where two identical requests arrive
+		// at the exact same time. The database's UNIQUE constraint (PGError 23505)
+		// will catch it.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" { // 23505 = unique_violation
+			respondWithError(w, http.StatusConflict, "Duplicate request in progress")
+		} else {
+			log.Printf("Failed to insert idempotency key: %v\n", err)
+			respondWithError(w, http.StatusInternalServerError, "Database error")
+		}
+		return
+	}
+
+	// 7. === CORE TRANSFER LOGIC ===
 
 	// === DEADLOCK PREVENTION ===
-	// Lock accounts in a consistent order (smallest ID first)
+	// Lock accounts in a consistent order (smallest ID first).
 	var acc1_id, acc2_id = req.FromAccountID, req.ToAccountID
 	if acc1_id > acc2_id {
 		acc1_id, acc2_id = req.ToAccountID, req.FromAccountID
 	}
 
-	// Lock the *first* account
+	// Lock the *first* account row
 	var balance1 int64
-	err = tx.QueryRow(context.Background(), "SELECT balance FROM accounts WHERE id = $1 FOR UPDATE", acc1_id).Scan(&balance1)
+	err = tx.QueryRow(ctx, "SELECT balance FROM accounts WHERE id = $1 FOR UPDATE", acc1_id).Scan(&balance1)
 	if err != nil {
-		log.Printf("Account 1 (%d) not found: %v\n", acc1_id, err)
-		http.Error(w, "Account 1 not found", http.StatusInternalServerError)
+		respondWithError(w, http.StatusNotFound, "Account 1 not found")
 		return
 	}
 
-	// Lock the *second* account
+	// Lock the *second* account row
 	var balance2 int64
-	err = tx.QueryRow(context.Background(), "SELECT balance FROM accounts WHERE id = $1 FOR UPDATE", acc2_id).Scan(&balance2)
+	err = tx.QueryRow(ctx, "SELECT balance FROM accounts WHERE id = $1 FOR UPDATE", acc2_id).Scan(&balance2)
 	if err != nil {
-		log.Printf("Account 2 (%d) not found: %v\n", acc2_id, err)
-		http.Error(w, "Account 2 not found", http.StatusInternalServerError)
+		respondWithError(w, http.StatusNotFound, "Account 2 not found")
 		return
 	}
 
@@ -128,47 +221,104 @@ func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if fromBalance < req.Amount {
-		http.Error(w, "Insufficient funds", http.StatusBadRequest)
+		respondWithError(w, http.StatusUnprocessableEntity, "Insufficient funds")
 		return
 	}
 
-	// Create the ledger entries
-	_, err = tx.Exec(context.Background(),
-		"INSERT INTO ledger_entries (debit_account_id, credit_account_id, amount) VALUES ($1, $2, $3)",
-		req.FromAccountID, req.ToAccountID, req.Amount)
+	// --- Execute the Double-Entry SQL ---
+
+	// 1. Create the 'transfers' record
+	var transferID int64
+	err = tx.QueryRow(ctx,
+		"INSERT INTO transfers (from_account_id, to_account_id, amount) VALUES ($1, $2, $3) RETURNING id",
+		req.FromAccountID, req.ToAccountID, req.Amount,
+	).Scan(&transferID)
 	if err != nil {
-		log.Printf("Failed to create ledger entry: %v\n", err)
-		http.Error(w, "Failed to create ledger entry", http.StatusInternalServerError)
+		log.Printf("Failed to create transfer: %v\n", err)
+		respondWithError(w, http.StatusInternalServerError, "Failed to create transfer")
 		return
 	}
 
-	// Update balances
-	_, err = tx.Exec(context.Background(),
+	// 2. Create the debit leg (negative delta)
+	_, err = tx.Exec(ctx,
+		"INSERT INTO ledger_entries (transfer_id, account_id, delta) VALUES ($1, $2, $3)",
+		transferID, req.FromAccountID, -req.Amount,
+	)
+	if err != nil {
+		log.Printf("Failed to create debit entry: %v\n", err)
+		respondWithError(w, http.StatusInternalServerError, "Failed to create ledger entry")
+		return
+	}
+
+	// 3. Create the credit leg (positive delta)
+	_, err = tx.Exec(ctx,
+		"INSERT INTO ledger_entries (transfer_id, account_id, delta) VALUES ($1, $2, $3)",
+		transferID, req.ToAccountID, req.Amount,
+	)
+	if err != nil {
+		log.Printf("Failed to create credit entry: %v\n", err)
+		respondWithError(w, http.StatusInternalServerError, "Failed to create ledger entry")
+		return
+	}
+
+	// 4. Update sender balance
+	_, err = tx.Exec(ctx,
 		"UPDATE accounts SET balance = balance - $1 WHERE id = $2",
-		req.Amount, req.FromAccountID)
+		req.Amount, req.FromAccountID,
+	)
 	if err != nil {
 		log.Printf("Failed to update sender balance: %v\n", err)
-		http.Error(w, "Failed to update sender balance", http.StatusInternalServerError)
+		respondWithError(w, http.StatusInternalServerError, "Failed to update balance")
 		return
 	}
 
-	_, err = tx.Exec(context.Background(),
+	// 5. Update receiver balance
+	_, err = tx.Exec(ctx,
 		"UPDATE accounts SET balance = balance + $1 WHERE id = $2",
-		req.Amount, req.ToAccountID)
+		req.Amount, req.ToAccountID,
+	)
 	if err != nil {
 		log.Printf("Failed to update receiver balance: %v\n", err)
-		http.Error(w, "Failed to update receiver balance", http.StatusInternalServerError)
+		respondWithError(w, http.StatusInternalServerError, "Failed to update balance")
 		return
 	}
 
+	// 8. === IDEMPOTENCY ===
+	// Create the canonical response
+	resp := TransferResponse{
+		TransferID:    transferID,
+		FromAccountID: req.FromAccountID,
+		ToAccountID:   req.ToAccountID,
+		Amount:        req.Amount,
+	}
+
+	// Store the response body for future replays
+	respBody, err := json.Marshal(resp)
+	if err != nil {
+		log.Printf("Failed to marshal response: %v\n", err)
+		respondWithError(w, http.StatusInternalServerError, "Internal server error")
+		return
+	}
+
+	// Atomically update the key to 'completed'
+	_, err = tx.Exec(ctx,
+		"UPDATE idempotency_keys SET status = 'completed', transfer_id = $1, response_status = $2, response_body = $3 WHERE key = $4",
+		transferID, http.StatusCreated, respBody, idempotencyKey,
+	)
+	if err != nil {
+		log.Printf("Failed to finalize idempotency key: %v\n", err)
+		respondWithError(w, http.StatusInternalServerError, "Failed to finalize transaction")
+		return
+	}
+
+	// 9. === COMMIT ===
 	// Commit the transaction
-	if err = tx.Commit(context.Background()); err != nil {
+	if err = tx.Commit(ctx); err != nil {
 		log.Printf("Failed to commit transaction: %v\n", err)
-		http.Error(w, "Failed to commit transaction", http.StatusInternalServerError)
+		respondWithError(w, http.StatusInternalServerError, "Failed to commit transaction")
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "transfer successful"})
+	// 10. Respond with 201 Created (for a NEW request)
+	respondWithJSON(w, http.StatusCreated, resp)
 }
