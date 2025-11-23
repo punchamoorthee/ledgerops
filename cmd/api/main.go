@@ -59,9 +59,12 @@ func main() {
 	r.HandleFunc("/accounts", CreateAccountHandler).Methods("POST")
 	r.HandleFunc("/transfers", CreateTransferHandler).Methods("POST")
 
-	r.Handle("/metrics", promhttp.Handler()).Methods("GET")
-
+	// === READ ROUTES ===
 	r.HandleFunc("/transfers/{id}", GetTransferHandler).Methods("GET")
+	r.HandleFunc("/accounts/{id}", GetAccountHandler).Methods("GET")
+	r.HandleFunc("/accounts/{id}/entries", GetAccountEntriesHandler).Methods("GET")
+
+	r.Handle("/metrics", promhttp.Handler()).Methods("GET")
 
 	log.Println("Starting server on :8080")
 	log.Fatal(http.ListenAndServe(":8080", r))
@@ -99,6 +102,12 @@ func CreateAccountHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]int64{"account_id": accountID})
+}
+
+// Account represents the 'accounts' table record
+type Account struct {
+	ID      int64 `json:"id"`
+	Balance int64 `json:"balance"`
 }
 
 // Represents the JSON we expect from the user
@@ -416,4 +425,65 @@ func GetTransferHandler(w http.ResponseWriter, r *http.Request) {
 
 	httpRequestsTotal.WithLabelValues("GET", "/transfers/{id}", "200").Inc()
 	respondWithJSON(w, http.StatusOK, transfer)
+}
+
+func GetAccountHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	var account Account
+	// Query account balance
+	err := db.QueryRow(context.Background(),
+		"SELECT id, balance FROM accounts WHERE id = $1",
+		id).Scan(&account.ID, &account.Balance)
+
+	if err == pgx.ErrNoRows {
+		httpRequestsTotal.WithLabelValues("GET", "/accounts/{id}", "404").Inc()
+		respondWithError(w, http.StatusNotFound, "Account not found")
+		return
+	} else if err != nil {
+		httpRequestsTotal.WithLabelValues("GET", "/accounts/{id}", "500").Inc()
+		respondWithError(w, http.StatusInternalServerError, "Database error")
+		return
+	}
+
+	httpRequestsTotal.WithLabelValues("GET", "/accounts/{id}", "200").Inc()
+	respondWithJSON(w, http.StatusOK, account)
+}
+
+func GetAccountEntriesHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	accountID := vars["id"]
+
+	// Check if account exists first
+	var exists bool
+	err := db.QueryRow(context.Background(), "SELECT EXISTS(SELECT 1 FROM accounts WHERE id=$1)", accountID).Scan(&exists)
+	if err != nil || !exists {
+		httpRequestsTotal.WithLabelValues("GET", "/accounts/{id}/entries", "404").Inc()
+		respondWithError(w, http.StatusNotFound, "Account not found")
+		return
+	}
+
+	// Query ledger entries
+	rows, err := db.Query(context.Background(),
+		"SELECT account_id, delta FROM ledger_entries WHERE account_id = $1 ORDER BY created_at DESC",
+		accountID)
+	if err != nil {
+		httpRequestsTotal.WithLabelValues("GET", "/accounts/{id}/entries", "500").Inc()
+		respondWithError(w, http.StatusInternalServerError, "Database error")
+		return
+	}
+	defer rows.Close()
+
+	var entries []LedgerEntry
+	for rows.Next() {
+		var entry LedgerEntry
+		if err := rows.Scan(&entry.AccountID, &entry.Delta); err != nil {
+			continue
+		}
+		entries = append(entries, entry)
+	}
+
+	httpRequestsTotal.WithLabelValues("GET", "/accounts/{id}/entries", "200").Inc()
+	respondWithJSON(w, http.StatusOK, entries)
 }
