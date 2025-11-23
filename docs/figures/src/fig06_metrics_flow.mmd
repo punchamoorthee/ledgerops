@@ -8,17 +8,17 @@ flowchart LR
   G[Grafana]
 
   subgraph Metrics["Key metrics"]
-    M1[[requests_total]]
-    M2[[request_latency_seconds]]
-    M3[[aborts_total]]
-    M4[[replays_total]]
+    M1[["requests_total"]]
+    M2[["request_duration_seconds"]]
+    M3[["aborts (derived)"]]
+    M4[["replays (derived)"]]
   end
 
   P -- "scrape /metrics" --> A
   A --> M1
   A --> M2
-  A --> M3
-  A --> M4
+  A -.-> M3
+  A -.-> M4
   G -- query --> P
 
   classDef accent stroke:#40826D,stroke-width:2px,fill:#ffffff,color:#0a0a0a;
