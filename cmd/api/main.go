@@ -17,11 +17,28 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Global variable for the database connection pool
 var db *pgxpool.Pool
+
+var (
+	// Measures total requests. We verify success vs failure here.
+	httpRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "ledger_http_requests_total",
+		Help: "Total number of HTTP requests",
+	}, []string{"method", "endpoint", "status"})
+
+	// Measures latency (speed). Crucial for p99 goals.
+	httpRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "ledger_http_request_duration_seconds",
+		Help:    "Duration of HTTP requests",
+		Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1}, // Buckets from 5ms to 1s
+	}, []string{"method", "endpoint"})
+)
 
 func main() {
 	connString := os.Getenv("DB_SOURCE")
@@ -43,6 +60,8 @@ func main() {
 	r.HandleFunc("/transfers", CreateTransferHandler).Methods("POST")
 
 	r.Handle("/metrics", promhttp.Handler()).Methods("GET")
+
+	r.HandleFunc("/transfers/{id}", GetTransferHandler).Methods("GET")
 
 	log.Println("Starting server on :8080")
 	log.Fatal(http.ListenAndServe(":8080", r))
@@ -111,12 +130,17 @@ type TransferResponse struct {
 }
 
 func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
+	// 1. Start the timer
+	timer := prometheus.NewTimer(httpRequestDuration.WithLabelValues("POST", "/transfers"))
+	defer timer.ObserveDuration()
+
 	ctx := context.Background()
 
 	// === IDEMPOTENCY (GATE) ===
 	// 1. Get the idempotency key from the header.
 	idempotencyKey := r.Header.Get("Idempotency-Key")
 	if idempotencyKey == "" {
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "400").Inc() // Bad Request
 		respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
@@ -124,6 +148,7 @@ func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
 	// 2. Read and HASH the request body for idempotency check
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc() // Server Error
 		respondWithError(w, http.StatusInternalServerError, "Cannot read request body")
 		return
 	}
@@ -135,16 +160,19 @@ func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
 	// 3. Parse the request body
 	var req TransferRequest
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "400").Inc() // Bad Request
 		respondWithError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
 	// 4. Validate business rules
 	if req.Amount <= 0 {
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "422").Inc() // Unprocessable
 		respondWithError(w, http.StatusUnprocessableEntity, "Amount must be positive")
 		return
 	}
 	if req.FromAccountID == req.ToAccountID {
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "422").Inc() // Unprocessable
 		respondWithError(w, http.StatusUnprocessableEntity, "Cannot transfer to the same account")
 		return
 	}
@@ -154,6 +182,7 @@ func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
 	tx, err := db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 	if err != nil {
 		log.Printf("Failed to start transaction: %v\n", err)
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
 		respondWithError(w, http.StatusInternalServerError, "Failed to start transaction")
 		return
 	}
@@ -172,6 +201,7 @@ func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		// CHECK HASH: Ensure this isn't a key reuse with a different body.
 		if storedHash != reqHash {
+			httpRequestsTotal.WithLabelValues("POST", "/transfers", "422").Inc()
 			respondWithError(w, http.StatusUnprocessableEntity, "Idempotency-Key reused with different request")
 			return
 		}
@@ -181,12 +211,14 @@ func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
 		// Note: We are replaying with 200 OK, not the original status code.
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "200").Inc() // REPLAY SUCCESS
 		w.WriteHeader(http.StatusOK)
 		w.Write(storedBody)
 		return
 
 	} else if err != pgx.ErrNoRows {
 		log.Printf("Failed to query idempotency key: %v\n", err)
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
 		respondWithError(w, http.StatusInternalServerError, "Database error")
 		return
 	}
@@ -201,9 +233,11 @@ func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" { // 23505 = unique_violation
 			// This handles the race condition.
+			httpRequestsTotal.WithLabelValues("POST", "/transfers", "409").Inc() // CONFLICT
 			respondWithError(w, http.StatusConflict, "Duplicate request in progress")
 		} else {
 			log.Printf("Failed to insert idempotency key: %v\n", err)
+			httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
 			respondWithError(w, http.StatusInternalServerError, "Database error")
 		}
 		return
@@ -220,6 +254,7 @@ func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
 	var balance1 int64
 	err = tx.QueryRow(ctx, "SELECT balance FROM accounts WHERE id = $1 FOR UPDATE", acc1_id).Scan(&balance1)
 	if err != nil {
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "404").Inc() // Not Found
 		respondWithError(w, http.StatusNotFound, "Account 1 not found")
 		return
 	}
@@ -227,6 +262,7 @@ func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
 	var balance2 int64
 	err = tx.QueryRow(ctx, "SELECT balance FROM accounts WHERE id = $1 FOR UPDATE", acc2_id).Scan(&balance2)
 	if err != nil {
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "404").Inc() // Not Found
 		respondWithError(w, http.StatusNotFound, "Account 2 not found")
 		return
 	}
@@ -240,6 +276,7 @@ func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if fromBalance < req.Amount {
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "422").Inc() // INSUFFICIENT FUNDS
 		respondWithError(w, http.StatusUnprocessableEntity, "Insufficient funds")
 		return
 	}
@@ -254,6 +291,7 @@ func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
 	).Scan(&transferID)
 	if err != nil {
 		log.Printf("Failed to create transfer: %v\n", err)
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
 		respondWithError(w, http.StatusInternalServerError, "Failed to create transfer")
 		return
 	}
@@ -265,6 +303,7 @@ func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
 	)
 	if err != nil {
 		log.Printf("Failed to create debit entry: %v\n", err)
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
 		respondWithError(w, http.StatusInternalServerError, "Failed to create ledger entry")
 		return
 	}
@@ -276,6 +315,7 @@ func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
 	)
 	if err != nil {
 		log.Printf("Failed to create credit entry: %v\n", err)
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
 		respondWithError(w, http.StatusInternalServerError, "Failed to create ledger entry")
 		return
 	}
@@ -287,6 +327,7 @@ func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
 	)
 	if err != nil {
 		log.Printf("Failed to update sender balance: %v\n", err)
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
 		respondWithError(w, http.StatusInternalServerError, "Failed to update balance")
 		return
 	}
@@ -298,6 +339,7 @@ func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
 	)
 	if err != nil {
 		log.Printf("Failed to update receiver balance: %v\n", err)
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
 		respondWithError(w, http.StatusInternalServerError, "Failed to update balance")
 		return
 	}
@@ -321,6 +363,7 @@ func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
 	respBody, err := json.Marshal(resp)
 	if err != nil {
 		log.Printf("Failed to marshal response: %v\n", err)
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
 		respondWithError(w, http.StatusInternalServerError, "Internal server error")
 		return
 	}
@@ -332,6 +375,7 @@ func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
 	)
 	if err != nil {
 		log.Printf("Failed to finalize idempotency key: %v\n", err)
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
 		respondWithError(w, http.StatusInternalServerError, "Failed to finalize transaction")
 		return
 	}
@@ -339,11 +383,37 @@ func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
 	// 10. === COMMIT ===
 	if err = tx.Commit(ctx); err != nil {
 		log.Printf("Failed to commit transaction: %v\n", err)
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
 		respondWithError(w, http.StatusInternalServerError, "Failed to commit transaction")
 		return
 	}
 
 	// 11. Respond with 201 Created (for a NEW request)
 	w.Header().Set("Location", fmt.Sprintf("/transfers/%d", transferID))
+	httpRequestsTotal.WithLabelValues("POST", "/transfers", "201").Inc() // SUCCESS!
 	respondWithJSON(w, http.StatusCreated, resp)
+}
+
+func GetTransferHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	// Simple SQL query to get the transfer status
+	var transfer Transfer
+	err := db.QueryRow(context.Background(),
+		"SELECT id, from_account_id, to_account_id, amount, status FROM transfers WHERE id = $1",
+		id).Scan(&transfer.ID, &transfer.FromAccountID, &transfer.ToAccountID, &transfer.Amount, &transfer.Status)
+
+	if err == pgx.ErrNoRows {
+		httpRequestsTotal.WithLabelValues("GET", "/transfers/{id}", "404").Inc()
+		respondWithError(w, http.StatusNotFound, "Transfer not found")
+		return
+	} else if err != nil {
+		httpRequestsTotal.WithLabelValues("GET", "/transfers/{id}", "500").Inc()
+		respondWithError(w, http.StatusInternalServerError, "Database error")
+		return
+	}
+
+	httpRequestsTotal.WithLabelValues("GET", "/transfers/{id}", "200").Inc()
+	respondWithJSON(w, http.StatusOK, transfer)
 }
