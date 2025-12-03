@@ -1,14 +1,14 @@
 package main
 
 import (
-	"bytes" // For reading and hashing request body
+	"bytes"
 	"context"
-	"crypto/sha256" // For request_hash
-	"encoding/hex"  // For request_hash
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt" // For setting Location header
-	"io"  // For reading request body
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -22,51 +22,50 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Global variable for the database connection pool
 var db *pgxpool.Pool
 
+// Metrics instrumentation
 var (
-	// Measures total requests. We verify success vs failure here.
 	httpRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "ledger_http_requests_total",
-		Help: "Total number of HTTP requests",
+		Help: "Total HTTP requests processed, labeled by status code",
 	}, []string{"method", "endpoint", "status"})
 
-	// Measures latency (speed). Crucial for p99 goals.
 	httpRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "ledger_http_request_duration_seconds",
-		Help:    "Duration of HTTP requests",
-		Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1}, // Buckets from 5ms to 1s
+		Help:    "Latency distribution of HTTP requests",
+		Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1},
 	}, []string{"method", "endpoint"})
 )
 
 func main() {
 	connString := os.Getenv("DB_SOURCE")
 	if connString == "" {
-		log.Fatal("DB_SOURCE environment variable is not set")
+		log.Fatal("DB_SOURCE environment variable is required")
 	}
 
 	var err error
+	// Initialize connection pool
 	db, err = pgxpool.New(context.Background(), connString)
 	if err != nil {
-		log.Fatalf("Unable to connect to database: %v\n", err)
+		log.Fatalf("Database connection failure: %v\n", err)
 	}
 	defer db.Close()
 
 	r := mux.NewRouter()
 
+	// System endpoints
 	r.HandleFunc("/healthz", HealthCheckHandler).Methods("GET")
+	r.Handle("/metrics", promhttp.Handler()).Methods("GET")
+
+	// Domain endpoints
 	r.HandleFunc("/accounts", CreateAccountHandler).Methods("POST")
 	r.HandleFunc("/transfers", CreateTransferHandler).Methods("POST")
-
-	// === READ ROUTES ===
 	r.HandleFunc("/transfers/{id}", GetTransferHandler).Methods("GET")
 	r.HandleFunc("/accounts/{id}", GetAccountHandler).Methods("GET")
 	r.HandleFunc("/accounts/{id}/entries", GetAccountEntriesHandler).Methods("GET")
 
-	r.Handle("/metrics", promhttp.Handler()).Methods("GET")
-
-	log.Println("Starting server on :8080")
+	log.Println("Service listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", r))
 }
 
@@ -88,14 +87,15 @@ func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 	}
 }
 
+// CreateAccountHandler initializes a new account with zero balance.
 func CreateAccountHandler(w http.ResponseWriter, r *http.Request) {
 	var accountID int64
 	query := "INSERT INTO accounts (balance) VALUES (0) RETURNING id"
 
 	err := db.QueryRow(context.Background(), query).Scan(&accountID)
 	if err != nil {
-		log.Printf("Failed to create account: %v\n", err) // Log the error
-		http.Error(w, "Failed to create account", http.StatusInternalServerError)
+		log.Printf("Account creation failed: %v\n", err)
+		http.Error(w, "System error creating account", http.StatusInternalServerError)
 		return
 	}
 
@@ -104,20 +104,18 @@ func CreateAccountHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]int64{"account_id": accountID})
 }
 
-// Account represents the 'accounts' table record
+// Data Transfer Objects
 type Account struct {
 	ID      int64 `json:"id"`
 	Balance int64 `json:"balance"`
 }
 
-// Represents the JSON we expect from the user
 type TransferRequest struct {
 	FromAccountID int64 `json:"from_account_id"`
 	ToAccountID   int64 `json:"to_account_id"`
 	Amount        int64 `json:"amount"`
 }
 
-// Transfer represents the 'transfers' table record
 type Transfer struct {
 	ID            int64  `json:"id"`
 	FromAccountID int64  `json:"from_account_id"`
@@ -126,39 +124,36 @@ type Transfer struct {
 	Status        string `json:"status"`
 }
 
-// LedgerEntry represents a single leg of the double-entry
 type LedgerEntry struct {
 	AccountID int64 `json:"account_id"`
 	Delta     int64 `json:"delta"`
 }
 
-// TransferResponse is the canonical successful response
 type TransferResponse struct {
 	Transfer Transfer      `json:"transfer"`
 	Entries  []LedgerEntry `json:"entries"`
 }
 
+// CreateTransferHandler executes an atomic double-entry transfer with idempotency.
 func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
-	// 1. Start the timer
 	timer := prometheus.NewTimer(httpRequestDuration.WithLabelValues("POST", "/transfers"))
 	defer timer.ObserveDuration()
 
 	ctx := context.Background()
 
-	// === IDEMPOTENCY (GATE) ===
-	// 1. Get the idempotency key from the header.
+	// Idempotency: Key Validation
 	idempotencyKey := r.Header.Get("Idempotency-Key")
 	if idempotencyKey == "" {
-		httpRequestsTotal.WithLabelValues("POST", "/transfers", "400").Inc() // Bad Request
-		respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "400").Inc()
+		respondWithError(w, http.StatusBadRequest, "Missing Idempotency-Key header")
 		return
 	}
 
-	// 2. Read and HASH the request body for idempotency check
+	// Payload integrity check
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc() // Server Error
-		respondWithError(w, http.StatusInternalServerError, "Cannot read request body")
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
+		respondWithError(w, http.StatusInternalServerError, "Stream read error")
 		return
 	}
 	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
@@ -166,39 +161,36 @@ func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
 	hash := sha256.Sum256(bodyBytes)
 	reqHash := hex.EncodeToString(hash[:])
 
-	// 3. Parse the request body
 	var req TransferRequest
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		httpRequestsTotal.WithLabelValues("POST", "/transfers", "400").Inc() // Bad Request
-		respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "400").Inc()
+		respondWithError(w, http.StatusBadRequest, "Malformed JSON body")
 		return
 	}
 
-	// 4. Validate business rules
+	// Business Rules
 	if req.Amount <= 0 {
-		httpRequestsTotal.WithLabelValues("POST", "/transfers", "422").Inc() // Unprocessable
-		respondWithError(w, http.StatusUnprocessableEntity, "Amount must be positive")
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "422").Inc()
+		respondWithError(w, http.StatusUnprocessableEntity, "Positive amount required")
 		return
 	}
 	if req.FromAccountID == req.ToAccountID {
-		httpRequestsTotal.WithLabelValues("POST", "/transfers", "422").Inc() // Unprocessable
-		respondWithError(w, http.StatusUnprocessableEntity, "Cannot transfer to the same account")
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "422").Inc()
+		respondWithError(w, http.StatusUnprocessableEntity, "Self-transfer not allowed")
 		return
 	}
 
-	// === ATOMIC TRANSACTION (BEGIN) ===
-	// 5. Begin a new transaction with REPEATABLE READ isolation
+	// Transaction: Start
 	tx, err := db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 	if err != nil {
-		log.Printf("Failed to start transaction: %v\n", err)
+		log.Printf("Tx begin failed: %v\n", err)
 		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
-		respondWithError(w, http.StatusInternalServerError, "Failed to start transaction")
+		respondWithError(w, http.StatusInternalServerError, "Transaction initialization failure")
 		return
 	}
 	defer tx.Rollback(ctx)
 
-	// 6. === IDEMPOTENCY (CHECK) ===
-	// Check if this key has already been processed.
+	// Idempotency: State Check
 	var storedStatus int
 	var storedBody json.RawMessage
 	var storedHash string
@@ -208,75 +200,69 @@ func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
 	).Scan(&storedStatus, &storedBody, &storedHash)
 
 	if err == nil {
-		// CHECK HASH: Ensure this isn't a key reuse with a different body.
+		// Key exists: Integrity Check
 		if storedHash != reqHash {
 			httpRequestsTotal.WithLabelValues("POST", "/transfers", "422").Inc()
-			respondWithError(w, http.StatusUnprocessableEntity, "Idempotency-Key reused with different request")
+			respondWithError(w, http.StatusUnprocessableEntity, "Key reuse with mismatched payload")
 			return
 		}
 
-		// This is a valid replay.
-		log.Printf("Replaying idempotent request: %s", idempotencyKey)
+		// Valid Replay
+		log.Printf("Replaying request: %s", idempotencyKey)
 		w.Header().Set("Content-Type", "application/json")
-
-		// Note: We are replaying with 200 OK, not the original status code.
-		httpRequestsTotal.WithLabelValues("POST", "/transfers", "200").Inc() // REPLAY SUCCESS
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "200").Inc()
 		w.WriteHeader(http.StatusOK)
 		w.Write(storedBody)
 		return
 
 	} else if err != pgx.ErrNoRows {
-		log.Printf("Failed to query idempotency key: %v\n", err)
+		log.Printf("Idempotency query error: %v\n", err)
 		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
-		respondWithError(w, http.StatusInternalServerError, "Database error")
+		respondWithError(w, http.StatusInternalServerError, "Storage error")
 		return
 	}
 
-	// 7. === IDEMPOTENCY (RECORD) ===
-	// Record the key as 'in_progress' to prevent a concurrent duplicate.
+	// Idempotency: Reservation
 	_, err = tx.Exec(ctx,
 		"INSERT INTO idempotency_keys (key, request_hash, status) VALUES ($1, $2, 'in_progress')",
 		idempotencyKey, reqHash,
 	)
 	if err != nil {
 		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" { // 23505 = unique_violation
-			// This handles the race condition.
-			httpRequestsTotal.WithLabelValues("POST", "/transfers", "409").Inc() // CONFLICT
-			respondWithError(w, http.StatusConflict, "Duplicate request in progress")
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" { // Unique violation
+			httpRequestsTotal.WithLabelValues("POST", "/transfers", "409").Inc()
+			respondWithError(w, http.StatusConflict, "Request processing in progress")
 		} else {
-			log.Printf("Failed to insert idempotency key: %v\n", err)
+			log.Printf("Key reservation error: %v\n", err)
 			httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
-			respondWithError(w, http.StatusInternalServerError, "Database error")
+			respondWithError(w, http.StatusInternalServerError, "Storage error")
 		}
 		return
 	}
 
-	// 8. === CORE TRANSFER LOGIC ===
-
-	// === DEADLOCK PREVENTION ===
+	// Concurrency Control: Deterministic Locking
+	// Sort IDs to prevent circular wait (deadlock)
 	var acc1_id, acc2_id = req.FromAccountID, req.ToAccountID
 	if acc1_id > acc2_id {
 		acc1_id, acc2_id = req.ToAccountID, req.FromAccountID
 	}
 
-	var balance1 int64
+	var balance1, balance2 int64
+	// Acquire locks in order
 	err = tx.QueryRow(ctx, "SELECT balance FROM accounts WHERE id = $1 FOR UPDATE", acc1_id).Scan(&balance1)
 	if err != nil {
-		httpRequestsTotal.WithLabelValues("POST", "/transfers", "404").Inc() // Not Found
-		respondWithError(w, http.StatusNotFound, "Account 1 not found")
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "404").Inc()
+		respondWithError(w, http.StatusNotFound, "Account not found")
 		return
 	}
-
-	var balance2 int64
 	err = tx.QueryRow(ctx, "SELECT balance FROM accounts WHERE id = $1 FOR UPDATE", acc2_id).Scan(&balance2)
 	if err != nil {
-		httpRequestsTotal.WithLabelValues("POST", "/transfers", "404").Inc() // Not Found
-		respondWithError(w, http.StatusNotFound, "Account 2 not found")
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "404").Inc()
+		respondWithError(w, http.StatusNotFound, "Account not found")
 		return
 	}
 
-	// Check for sufficient funds
+	// Logic: Funds Check
 	var fromBalance int64
 	if req.FromAccountID == acc1_id {
 		fromBalance = balance1
@@ -285,83 +271,54 @@ func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if fromBalance < req.Amount {
-		httpRequestsTotal.WithLabelValues("POST", "/transfers", "422").Inc() // INSUFFICIENT FUNDS
+		httpRequestsTotal.WithLabelValues("POST", "/transfers", "422").Inc()
 		respondWithError(w, http.StatusUnprocessableEntity, "Insufficient funds")
 		return
 	}
 
-	// --- Execute the Double-Entry SQL ---
-
-	// 1. Create the 'transfers' record
+	// Execution: Ledger Update
 	var transferID int64
 	err = tx.QueryRow(ctx,
 		"INSERT INTO transfers (from_account_id, to_account_id, amount, status) VALUES ($1, $2, $3, 'completed') RETURNING id",
 		req.FromAccountID, req.ToAccountID, req.Amount,
 	).Scan(&transferID)
 	if err != nil {
-		log.Printf("Failed to create transfer: %v\n", err)
+		log.Printf("Transfer insert error: %v\n", err)
 		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
-		respondWithError(w, http.StatusInternalServerError, "Failed to create transfer")
+		respondWithError(w, http.StatusInternalServerError, "Write error")
 		return
 	}
 
-	// 2. Create the debit leg (negative delta)
+	// Immutable Double-Entry Logs
 	_, err = tx.Exec(ctx,
-		"INSERT INTO ledger_entries (transfer_id, account_id, delta) VALUES ($1, $2, $3)",
-		transferID, req.FromAccountID, -req.Amount,
+		"INSERT INTO ledger_entries (transfer_id, account_id, delta) VALUES ($1, $2, $3), ($1, $4, $5)",
+		transferID, req.FromAccountID, -req.Amount, req.ToAccountID, req.Amount,
 	)
 	if err != nil {
-		log.Printf("Failed to create debit entry: %v\n", err)
+		log.Printf("Ledger entry error: %v\n", err)
 		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
-		respondWithError(w, http.StatusInternalServerError, "Failed to create ledger entry")
+		respondWithError(w, http.StatusInternalServerError, "Write error")
 		return
 	}
 
-	// 3. Create the credit leg (positive delta)
-	_, err = tx.Exec(ctx,
-		"INSERT INTO ledger_entries (transfer_id, account_id, delta) VALUES ($1, $2, $3)",
-		transferID, req.ToAccountID, req.Amount,
-	)
+	// Balance Updates
+	_, err = tx.Exec(ctx, "UPDATE accounts SET balance = balance - $1 WHERE id = $2", req.Amount, req.FromAccountID)
 	if err != nil {
-		log.Printf("Failed to create credit entry: %v\n", err)
-		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
-		respondWithError(w, http.StatusInternalServerError, "Failed to create ledger entry")
 		return
 	}
-
-	// 4. Update sender balance
-	_, err = tx.Exec(ctx,
-		"UPDATE accounts SET balance = balance - $1 WHERE id = $2",
-		req.Amount, req.FromAccountID,
-	)
+	_, err = tx.Exec(ctx, "UPDATE accounts SET balance = balance + $1 WHERE id = $2", req.Amount, req.ToAccountID)
 	if err != nil {
-		log.Printf("Failed to update sender balance: %v\n", err)
-		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
-		respondWithError(w, http.StatusInternalServerError, "Failed to update balance")
 		return
 	}
 
-	// 5. Update receiver balance
-	_, err = tx.Exec(ctx,
-		"UPDATE accounts SET balance = balance + $1 WHERE id = $2",
-		req.Amount, req.ToAccountID,
-	)
-	if err != nil {
-		log.Printf("Failed to update receiver balance: %v\n", err)
-		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
-		respondWithError(w, http.StatusInternalServerError, "Failed to update balance")
-		return
-	}
-
-	// 9. === IDEMPOTENCY (FINALIZE) ===
-	// Create the canonical response using the NEW nested structs
+	// Idempotency: Finalize
 	resp := TransferResponse{
 		Transfer: Transfer{
 			ID:            transferID,
 			FromAccountID: req.FromAccountID,
 			ToAccountID:   req.ToAccountID,
 			Amount:        req.Amount,
-			Status:        "completed", // From the SQL INSERT
+			Status:        "completed",
 		},
 		Entries: []LedgerEntry{
 			{AccountID: req.FromAccountID, Delta: -req.Amount},
@@ -371,35 +328,30 @@ func CreateTransferHandler(w http.ResponseWriter, r *http.Request) {
 
 	respBody, err := json.Marshal(resp)
 	if err != nil {
-		log.Printf("Failed to marshal response: %v\n", err)
-		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
-		respondWithError(w, http.StatusInternalServerError, "Internal server error")
 		return
 	}
 
-	// Atomically update the key to 'completed'
 	_, err = tx.Exec(ctx,
 		"UPDATE idempotency_keys SET status = 'completed', transfer_id = $1, response_status = $2, response_body = $3 WHERE key = $4",
 		transferID, http.StatusCreated, respBody, idempotencyKey,
 	)
 	if err != nil {
-		log.Printf("Failed to finalize idempotency key: %v\n", err)
+		log.Printf("Idempotency update error: %v\n", err)
 		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
-		respondWithError(w, http.StatusInternalServerError, "Failed to finalize transaction")
+		respondWithError(w, http.StatusInternalServerError, "Commit error")
 		return
 	}
 
-	// 10. === COMMIT ===
+	// Commit
 	if err = tx.Commit(ctx); err != nil {
-		log.Printf("Failed to commit transaction: %v\n", err)
+		log.Printf("Tx commit error: %v\n", err)
 		httpRequestsTotal.WithLabelValues("POST", "/transfers", "500").Inc()
-		respondWithError(w, http.StatusInternalServerError, "Failed to commit transaction")
+		respondWithError(w, http.StatusInternalServerError, "Commit error")
 		return
 	}
 
-	// 11. Respond with 201 Created (for a NEW request)
 	w.Header().Set("Location", fmt.Sprintf("/transfers/%d", transferID))
-	httpRequestsTotal.WithLabelValues("POST", "/transfers", "201").Inc() // SUCCESS!
+	httpRequestsTotal.WithLabelValues("POST", "/transfers", "201").Inc()
 	respondWithJSON(w, http.StatusCreated, resp)
 }
 
@@ -407,7 +359,6 @@ func GetTransferHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	id := vars["id"]
 
-	// Simple SQL query to get the transfer status
 	var transfer Transfer
 	err := db.QueryRow(context.Background(),
 		"SELECT id, from_account_id, to_account_id, amount, status FROM transfers WHERE id = $1",
@@ -419,7 +370,7 @@ func GetTransferHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	} else if err != nil {
 		httpRequestsTotal.WithLabelValues("GET", "/transfers/{id}", "500").Inc()
-		respondWithError(w, http.StatusInternalServerError, "Database error")
+		respondWithError(w, http.StatusInternalServerError, "Read error")
 		return
 	}
 
@@ -432,7 +383,6 @@ func GetAccountHandler(w http.ResponseWriter, r *http.Request) {
 	id := vars["id"]
 
 	var account Account
-	// Query account balance
 	err := db.QueryRow(context.Background(),
 		"SELECT id, balance FROM accounts WHERE id = $1",
 		id).Scan(&account.ID, &account.Balance)
@@ -443,7 +393,7 @@ func GetAccountHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	} else if err != nil {
 		httpRequestsTotal.WithLabelValues("GET", "/accounts/{id}", "500").Inc()
-		respondWithError(w, http.StatusInternalServerError, "Database error")
+		respondWithError(w, http.StatusInternalServerError, "Read error")
 		return
 	}
 
@@ -455,7 +405,7 @@ func GetAccountEntriesHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	accountID := vars["id"]
 
-	// Check if account exists first
+	// Validate account existence to differentiate 404 from empty history
 	var exists bool
 	err := db.QueryRow(context.Background(), "SELECT EXISTS(SELECT 1 FROM accounts WHERE id=$1)", accountID).Scan(&exists)
 	if err != nil || !exists {
@@ -464,13 +414,12 @@ func GetAccountEntriesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Query ledger entries
 	rows, err := db.Query(context.Background(),
 		"SELECT account_id, delta FROM ledger_entries WHERE account_id = $1 ORDER BY created_at DESC",
 		accountID)
 	if err != nil {
 		httpRequestsTotal.WithLabelValues("GET", "/accounts/{id}/entries", "500").Inc()
-		respondWithError(w, http.StatusInternalServerError, "Database error")
+		respondWithError(w, http.StatusInternalServerError, "Read error")
 		return
 	}
 	defer rows.Close()

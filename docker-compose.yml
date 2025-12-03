@@ -12,12 +12,11 @@ services:
       - '5432:5432'
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    # This command checks if the Postgres server is ready
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U admin -d ledger" ]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
   # SERVICE 1.5: The Migrator
   migrate:
@@ -28,7 +27,6 @@ services:
         condition: service_healthy
     volumes:
       - ./db/migration:/migrations
-    # This command is hard-coded to avoid variable issues
     command: [ "-path", "/migrations", "-database", "postgres://admin:secret@db:5432/ledger?sslmode=disable", "up" ]
 
   # SERVICE 2: The Go API
@@ -39,7 +37,10 @@ services:
     ports:
       - '8080:8080'
     depends_on:
-      - migrate
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     environment:
       - DB_SOURCE=postgres://admin:secret@db:5432/ledger?sslmode=disable
 
