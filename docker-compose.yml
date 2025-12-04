@@ -1,70 +1,40 @@
+version: '3.8'
+
 services:
-  # SERVICE 1: The PostgreSQL Database
-  db:
-    image: postgres:18.0
-    container_name: ledger_db
-    restart: always
+  postgres:
+    image: postgres:15-alpine
+    container_name: ledgerops-db
     environment:
-      - POSTGRES_USER=admin
-      - POSTGRES_PASSWORD=secret
-      - POSTGRES_DB=ledger
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: ledgerops
     ports:
-      - '5432:5432'
+      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U admin -d ledger" ]
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 5
 
-  # SERVICE 1.5: The Migrator
-  migrate:
-    image: migrate/migrate:v4.17.1
-    container_name: ledger_migrator
-    depends_on:
-      db:
-        condition: service_healthy
-    volumes:
-      - ./db/migration:/migrations
-    command: [ "-path", "/migrations", "-database", "postgres://admin:secret@db:5432/ledger?sslmode=disable", "up" ]
-
-  # SERVICE 2: The Go API
-  api:
-    container_name: ledger_api
+  app:
     build: .
-    restart: always
+    container_name: ledgerops-app
     ports:
-      - '8080:8080'
-    depends_on:
-      db:
-        condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
+      - "8080:8080"
     environment:
-      - DB_SOURCE=postgres://admin:secret@db:5432/ledger?sslmode=disable
-
-  # SERVICE 3: Prometheus
-  prometheus:
-    image: prom/prometheus:v3.6.0
-    container_name: prometheus
-    restart: always
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
-    ports:
-      - '9090:9090'
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=secret
+      - DB_NAME=ledgerops
+      - SERVER_PORT=8080
+      - LOG_LEVEL=info
     depends_on:
-      - api
-
-  # SERVICE 4: Grafana
-  grafana:
-    image: grafana/grafana:12.2.0
-    container_name: grafana
-    restart: always
-    ports:
-      - '3000:3000'
-    depends_on:
-      - prometheus
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   postgres_data:

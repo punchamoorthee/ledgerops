@@ -1,30 +1,34 @@
-# STAGE 1: Build the Go binary
-# Use a 'builder' image to keep our final image small
-FROM golang:1.25.2 AS builder
+# Build stage
+FROM golang:1.23-alpine AS builder
 
-# Set up the container's environment
+# Install build dependencies
+RUN apk add --no-cache git make
+
 WORKDIR /app
 
-# Copy the Go module files
+# Copy go mod files
 COPY go.mod go.sum ./
-
-# Download all the dependencies
 RUN go mod download
 
-# Copy the rest of the source code
+# Copy source code
 COPY . .
 
-# Build the Go app. 
-# CGO_ENABLED=0 is important for a small, static binary.
-RUN CGO_ENABLED=0 GOOS=linux go build -o /ledgerops_server ./cmd/api/
+# Build the binary
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o server ./cmd/server
 
-# STAGE 2: Create the final, small image
-FROM golang:1.25.2
+# Runtime stage
+FROM alpine:latest
 
-WORKDIR /
+RUN apk --no-cache add ca-certificates postgresql-client
 
-# Copy *only* the built binary from the 'builder' stage
-COPY --from=builder /ledgerops_server .
+WORKDIR /root/
 
-# This is the command that will run when the container starts
-CMD ["/ledgerops_server"]
+# Copy binary from builder
+COPY --from=builder /app/server .
+COPY --from=builder /app/db/migrations ./db/migrations
+
+# Expose port
+EXPOSE 8080
+
+# Run the binary
+CMD ["./server"]
