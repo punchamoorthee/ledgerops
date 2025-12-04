@@ -1,34 +1,20 @@
-# Build stage
+# Build Stage
 FROM golang:1.23-alpine AS builder
-
-# Install build dependencies
-RUN apk add --no-cache git make
-
 WORKDIR /app
-
-# Copy go mod files
 COPY go.mod go.sum ./
 RUN go mod download
-
-# Copy source code
 COPY . .
+# Build the new API entry point
+RUN CGO_ENABLED=0 GOOS=linux go build -o ledgerops ./cmd/api
 
-# Build the binary
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o server ./cmd/server
-
-# Runtime stage
+# Runtime Stage
 FROM alpine:latest
-
-RUN apk --no-cache add ca-certificates postgresql-client
-
 WORKDIR /root/
-
-# Copy binary from builder
-COPY --from=builder /app/server .
+RUN apk --no-cache add ca-certificates curl
+COPY --from=builder /app/ledgerops .
 COPY --from=builder /app/db/migrations ./db/migrations
+# Copy the benchmark script for container-to-container testing if needed
+COPY --from=builder /app/scripts ./scripts 
 
-# Expose port
 EXPOSE 8080
-
-# Run the binary
-CMD ["./server"]
+CMD ["./ledgerops"]

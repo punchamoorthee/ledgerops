@@ -2,96 +2,172 @@ package store
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/punchamoorthee/ledgerops/internal/models"
+	"github.com/punchamoorthee/ledgerops/internal/domain"
 )
 
-type Store struct {
-	Db *pgxpool.Pool
+var (
+	ErrAccountNotFound = errors.New("account not found")
+	ErrConflict        = errors.New("conflict")
+)
+
+type LedgerStore struct {
+	db *pgxpool.Pool
 }
 
-func NewStore(connString string) (*Store, error) {
-	config, err := pgxpool.ParseConfig(connString)
-	if err != nil {
-		return nil, fmt.Errorf("unable to parse database config: %w", err)
-	}
-
-	pool, err := pgxpool.NewWithConfig(context.Background(), config)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create connection pool: %w", err)
-	}
-
-	if err := pool.Ping(context.Background()); err != nil {
-		return nil, fmt.Errorf("unable to ping database: %w", err)
-	}
-
-	return &Store{Db: pool}, nil
+func NewLedgerStore(db *pgxpool.Pool) *LedgerStore {
+	return &LedgerStore{db: db}
 }
 
-func (s *Store) Close() {
-	s.Db.Close()
-}
-
-// GetAccount retrieves a single account by ID.
-func (s *Store) GetAccount(ctx context.Context, id int64) (*models.Account, error) {
-	var account models.Account
-	err := s.Db.QueryRow(ctx, "SELECT id, balance FROM accounts WHERE id = $1", id).Scan(&account.ID, &account.Balance)
-	if err != nil {
-		return nil, err
-	}
-	return &account, nil
-}
-
-// CreateAccount creates a new account with 0 balance.
-func (s *Store) CreateAccount(ctx context.Context) (int64, error) {
+func (s *LedgerStore) CreateAccount(ctx context.Context, initialBalance int64) (int64, error) {
 	var id int64
-	err := s.Db.QueryRow(ctx, "INSERT INTO accounts (balance) VALUES (0) RETURNING id").Scan(&id)
+	err := s.db.QueryRow(ctx, "INSERT INTO accounts (balance) VALUES ($1) RETURNING id", initialBalance).Scan(&id)
 	return id, err
 }
 
-// GetTransfer retrieves transfer details.
-func (s *Store) GetTransfer(ctx context.Context, id int64) (*models.Transfer, error) {
-	var t models.Transfer
-	err := s.Db.QueryRow(ctx,
-		"SELECT id, from_account_id, to_account_id, amount, status FROM transfers WHERE id = $1",
-		id).Scan(&t.ID, &t.FromAccountID, &t.ToAccountID, &t.Amount, &t.Status)
-	if err != nil {
-		return nil, err
+func (s *LedgerStore) GetAccount(ctx context.Context, id int64) (*domain.Account, error) {
+	var acc domain.Account
+	err := s.db.QueryRow(ctx, "SELECT id, balance FROM accounts WHERE id = $1", id).Scan(&acc.ID, &acc.Balance)
+	if err == pgx.ErrNoRows {
+		return nil, ErrAccountNotFound
 	}
-	return &t, nil
+	return &acc, err
 }
 
-// GetEntries retrieves ledger entries for a specific account.
-func (s *Store) GetEntries(ctx context.Context, accountID int64) ([]models.LedgerEntry, error) {
-	// First check if account exists
+func (s *LedgerStore) GetEntries(ctx context.Context, accountID int64) ([]domain.LedgerEntry, error) {
+	// First check existence
 	var exists bool
-	err := s.Db.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM accounts WHERE id=$1)", accountID).Scan(&exists)
-	if err != nil {
-		return nil, err
-	}
+	_ = s.db.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM accounts WHERE id=$1)", accountID).Scan(&exists)
 	if !exists {
-		return nil, fmt.Errorf("account not found")
+		return nil, ErrAccountNotFound
 	}
 
-	rows, err := s.Db.Query(ctx,
-		"SELECT account_id, delta FROM ledger_entries WHERE account_id = $1 ORDER BY created_at DESC",
-		accountID)
+	rows, err := s.db.Query(ctx, "SELECT account_id, delta FROM ledger_entries WHERE account_id = $1 ORDER BY created_at DESC", accountID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var entries []models.LedgerEntry
+	var entries []domain.LedgerEntry
 	for rows.Next() {
-		var entry models.LedgerEntry
-		if err := rows.Scan(&entry.AccountID, &entry.Delta); err != nil {
-			log.Printf("Error scanning entry: %v", err)
-			continue
+		var e domain.LedgerEntry
+		if err := rows.Scan(&e.AccountID, &e.Delta); err == nil {
+			entries = append(entries, e)
 		}
-		entries = append(entries, entry)
 	}
 	return entries, nil
+}
+
+// ExecTransfer implements the Core Transactional Logic
+func (s *LedgerStore) ExecTransfer(ctx context.Context, req domain.TransferRequest, idempotencyKey, reqHash string) (*domain.TransferResponse, error) {
+	// Start Tx with Repeatable Read
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	// 1. Idempotency Check
+	var storedStatus string
+	var storedBody json.RawMessage
+	var storedHash string
+
+	err = tx.QueryRow(ctx, "SELECT status, response_body, request_hash FROM idempotency_keys WHERE key = $1", idempotencyKey).
+		Scan(&storedStatus, &storedBody, &storedHash)
+
+	if err == nil {
+		// Key Found
+		if storedHash != reqHash {
+			return nil, fmt.Errorf("idempotency key mismatch")
+		}
+		if storedStatus == "in_progress" {
+			return nil, ErrConflict
+		}
+		// Return cached response
+		var resp domain.TransferResponse
+		if err := json.Unmarshal(storedBody, &resp); err != nil {
+			return nil, err
+		}
+		return &resp, nil // 200 OK replay
+	} else if err != pgx.ErrNoRows {
+		return nil, err
+	}
+
+	// 2. Reserve Key
+	_, err = tx.Exec(ctx, "INSERT INTO idempotency_keys (key, request_hash, status) VALUES ($1, $2, 'in_progress')", idempotencyKey, reqHash)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return nil, ErrConflict
+		}
+		return nil, err
+	}
+
+	// 3. Deterministic Locking (Smallest ID first)
+	first, second := req.FromAccountID, req.ToAccountID
+	if first > second {
+		first, second = second, first
+	}
+
+	// Using Exec to lock rows, just checking existence effectively while locking
+	// We read balance later, but locking explicitly first is cleaner for deadlock prevention
+	for _, id := range []int64{first, second} {
+		var b int64
+		if err := tx.QueryRow(ctx, "SELECT balance FROM accounts WHERE id = $1 FOR UPDATE", id).Scan(&b); err != nil {
+			return nil, ErrAccountNotFound
+		}
+	}
+
+	// 4. Check Balance
+	var fromBalance int64
+	if err := tx.QueryRow(ctx, "SELECT balance FROM accounts WHERE id = $1", req.FromAccountID).Scan(&fromBalance); err != nil {
+		return nil, err
+	}
+	if fromBalance < req.Amount {
+		return nil, fmt.Errorf("insufficient funds")
+	}
+
+	// 5. Execute Moves
+	var transferID int64
+	err = tx.QueryRow(ctx, "INSERT INTO transfers (from_account_id, to_account_id, amount, status) VALUES ($1, $2, $3, 'completed') RETURNING id",
+		req.FromAccountID, req.ToAccountID, req.Amount).Scan(&transferID)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = tx.Exec(ctx, "INSERT INTO ledger_entries (transfer_id, account_id, delta) VALUES ($1, $2, $3), ($1, $4, $5)",
+		transferID, req.FromAccountID, -req.Amount, req.ToAccountID, req.Amount)
+	if err != nil {
+		return nil, fmt.Errorf("ledger invariant likely violated: %v", err)
+	}
+
+	_, err = tx.Exec(ctx, "UPDATE accounts SET balance = balance - $1 WHERE id = $2", req.Amount, req.FromAccountID)
+	if err != nil {
+		return nil, err
+	}
+	_, err = tx.Exec(ctx, "UPDATE accounts SET balance = balance + $1 WHERE id = $2", req.Amount, req.ToAccountID)
+	if err != nil {
+		return nil, err
+	}
+
+	// 6. Finalize Response & Idempotency
+	resp := domain.TransferResponse{
+		Transfer: domain.Transfer{ID: transferID, FromAccountID: req.FromAccountID, ToAccountID: req.ToAccountID, Amount: req.Amount, Status: "completed"},
+		Entries:  []domain.LedgerEntry{{AccountID: req.FromAccountID, Delta: -req.Amount}, {AccountID: req.ToAccountID, Delta: req.Amount}},
+	}
+
+	respBytes, _ := json.Marshal(resp)
+	_, err = tx.Exec(ctx, "UPDATE idempotency_keys SET status = 'completed', transfer_id = $1, response_status = 201, response_body = $2 WHERE key = $3",
+		transferID, respBytes, idempotencyKey)
+	if err != nil {
+		return nil, err
+	}
+
+	return &resp, tx.Commit(ctx)
 }

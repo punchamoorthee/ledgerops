@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"os"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -10,42 +11,47 @@ import (
 
 const (
 	TotalAccounts  = 1000
-	InitialBalance = 1000 // In cents
+	InitialBalance = 10000 // $100.00
 )
 
 func main() {
-	// Uses localhost because it runs on the host machine via the script
-	connString := "postgres://admin:secret@localhost:5432/ledger?sslmode=disable"
+	dbURL := os.Getenv("DB_SOURCE")
+	if dbURL == "" {
+		// Fallback for local development if env not set
+		dbURL = "postgresql://admin:secret@localhost:5433/ledger?sslmode=disable"
+	}
 
 	ctx := context.Background()
-	conn, err := pgx.Connect(ctx, connString)
+	conn, err := pgx.Connect(ctx, dbURL)
 	if err != nil {
-		log.Fatalf("Seeder connection failed: %v", err)
+		log.Fatalf("Unable to connect to database: %v\n", err)
 	}
 	defer conn.Close(ctx)
 
 	log.Println("--- Seeding Database ---")
 
+	// 1. Clean Slate (Optional: dangerous in prod, useful for bench)
+	// _, err = conn.Exec(ctx, "TRUNCATE TABLE accounts, transfers, ledger_entries, idempotency_keys CASCADE")
+	// if err != nil { log.Fatal(err) }
+
+	// 2. Check existing
 	var count int
 	conn.QueryRow(ctx, "SELECT COUNT(*) FROM accounts").Scan(&count)
-	if count > 0 {
-		log.Printf("Database already contains %d accounts. Skipping.", count)
+	if count >= TotalAccounts {
+		log.Printf("Database already has %d accounts. Skipping.", count)
 		return
 	}
 
-	// Optimized Bulk Insert (Copy Protocol)
+	// 3. Bulk Insert using CopyFrom (Fastest method)
 	log.Printf("Generating %d accounts...", TotalAccounts)
 	rows := [][]interface{}{}
 	for i := 0; i < TotalAccounts; i++ {
-		// CHANGE: We removed the 'nil' for ID.
-		// We now only provide Balance and CreatedAt.
 		rows = append(rows, []interface{}{int64(InitialBalance), time.Now()})
 	}
 
-	countCopy, err := conn.CopyFrom(
+	copyCount, err := conn.CopyFrom(
 		ctx,
 		pgx.Identifier{"accounts"},
-		// CHANGE: We removed "id" from this list. Postgres will auto-generate it.
 		[]string{"balance", "created_at"},
 		pgx.CopyFromRows(rows),
 	)
@@ -54,5 +60,5 @@ func main() {
 		log.Fatalf("Bulk insert failed: %v", err)
 	}
 
-	log.Printf("Successfully seeded %d accounts.", countCopy)
+	log.Printf("Successfully seeded %d accounts.", copyCount)
 }

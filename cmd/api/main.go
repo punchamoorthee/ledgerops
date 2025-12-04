@@ -1,52 +1,49 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
-	"os"
 
 	"github.com/gorilla/mux"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/punchamoorthee/ledgerops/internal/api"
-	"github.com/punchamoorthee/ledgerops/internal/service"
+	"github.com/punchamoorthee/ledgerops/internal/config"
 	"github.com/punchamoorthee/ledgerops/internal/store"
 )
 
 func main() {
-	// 1. Configuration
-	connString := os.Getenv("DB_SOURCE")
-	if connString == "" {
-		log.Fatal("DB_SOURCE environment variable is required")
-	}
-
-	// 2. Database Initialization
-	store, err := store.NewStore(connString)
+	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("Database connection failure: %v\n", err)
+		log.Fatal(err)
 	}
-	defer store.Close()
 
-	// 3. Service Initialization
-	transferService := service.NewTransferService(store.Db)
+	dbPool, err := pgxpool.New(context.Background(), cfg.DBSource)
+	if err != nil {
+		log.Fatalf("Unable to connect to database: %v", err)
+	}
+	defer dbPool.Close()
 
-	// 4. Handler Initialization
-	h := api.NewHandler(store, transferService)
+	// Initialize Layers
+	ledgerStore := store.NewLedgerStore(dbPool)
+	handler := api.NewHandler(ledgerStore)
 
-	// 5. Router Setup
+	// Router
 	r := mux.NewRouter()
+	r.Handle("/metrics", promhttp.Handler())
+	r.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"ok"}`))
+	})
 
-	// System endpoints
-	r.HandleFunc("/healthz", h.HealthCheckHandler).Methods("GET")
-	r.Handle("/metrics", promhttp.Handler()).Methods("GET")
+	apiV1 := r.PathPrefix("/api/v1").Subrouter()
+	apiV1.HandleFunc("/accounts", handler.CreateAccount).Methods("POST")
+	apiV1.HandleFunc("/accounts/{id}", handler.GetAccount).Methods("GET")
+	apiV1.HandleFunc("/transfers", handler.CreateTransfer).Methods("POST")
 
-	// Domain endpoints
-	r.HandleFunc("/accounts", h.CreateAccountHandler).Methods("POST")
-	r.HandleFunc("/transfers", h.CreateTransferHandler).Methods("POST")
-	r.HandleFunc("/transfers/{id}", h.GetTransferHandler).Methods("GET")
-	r.HandleFunc("/accounts/{id}", h.GetAccountHandler).Methods("GET")
-	r.HandleFunc("/accounts/{id}/entries", h.GetAccountEntriesHandler).Methods("GET")
-
-	// 6. Start Server
-	log.Println("Service listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", r))
+	log.Printf("Server starting on :%s", cfg.Port)
+	if err := http.ListenAndServe(":"+cfg.Port, r); err != nil {
+		log.Fatal(err)
+	}
 }

@@ -1,40 +1,42 @@
 version: '3.8'
 
 services:
-  postgres:
+  db:
     image: postgres:15-alpine
     container_name: ledgerops-db
     environment:
-      POSTGRES_USER: postgres
+      POSTGRES_USER: admin
       POSTGRES_PASSWORD: secret
-      POSTGRES_DB: ledgerops
+      POSTGRES_DB: ledger
     ports:
-      - "5432:5432"
+      - "5433:5432" # Host:Container
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      test: ["CMD-SHELL", "pg_isready -U admin -d ledger"]
       interval: 5s
       timeout: 5s
       retries: 5
 
-  app:
+  api:
     build: .
-    container_name: ledgerops-app
+    container_name: ledgerops-api
     ports:
       - "8080:8080"
     environment:
-      - DB_HOST=postgres
-      - DB_PORT=5432
-      - DB_USER=postgres
-      - DB_PASSWORD=secret
-      - DB_NAME=ledgerops
+      - DB_SOURCE=postgresql://admin:secret@db:5432/ledger?sslmode=disable
       - SERVER_PORT=8080
-      - LOG_LEVEL=info
     depends_on:
-      postgres:
+      db:
         condition: service_healthy
     restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
 
 volumes:
   postgres_data:
