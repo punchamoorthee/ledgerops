@@ -2,7 +2,6 @@ import matplotlib.pyplot as plt
 import json
 import os
 
-# Configuration
 FILES = {
     'Uniform': 'results_uniform.json',
     'Hot-Spot': 'results_hotspot.json'
@@ -32,16 +31,13 @@ def main():
         print("No data found.")
         return
 
-    # Plot Setup
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
     
-    # 1. Throughput
     bars1 = ax1.bar(scenarios, tps, color=['#40826D', '#D9534F'])
     ax1.set_title('System Throughput')
     ax1.set_ylabel('Transactions Per Second (TPS)')
     ax1.bar_label(bars1, fmt='%.0f')
 
-    # 2. Abort Rate
     bars2 = ax2.bar(scenarios, abort_rates, color=['#40826D', '#D9534F'])
     ax2.set_title('Transaction Abort Rate')
     ax2.set_ylabel('Abort Rate (%)')

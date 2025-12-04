@@ -17,16 +17,16 @@ import (
 	"github.com/punchamoorthee/ledgerops/internal/store"
 )
 
-// Metrics
+// Prometheus Metrics
 var (
 	httpReqTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "ledger_http_requests_total",
-		Help: "Total HTTP requests",
+		Help: "Total HTTP requests classified by status",
 	}, []string{"method", "endpoint", "status"})
 
 	httpLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "ledger_http_request_duration_seconds",
-		Help:    "Request latency",
+		Help:    "Request latency distribution",
 		Buckets: []float64{0.005, 0.01, 0.05, 0.1, 0.5, 1},
 	}, []string{"method", "endpoint"})
 )
@@ -45,13 +45,21 @@ func (h *Handler) CreateTransfer(w http.ResponseWriter, r *http.Request) {
 
 	idemKey := r.Header.Get("Idempotency-Key")
 	if idemKey == "" {
-		h.respondError(w, http.StatusBadRequest, "Missing Idempotency-Key", "POST", "/transfers")
+		h.respondError(w, http.StatusBadRequest, "Missing Idempotency-Key header", "POST", "/transfers")
 		return
 	}
 
-	body, _ := io.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		h.respondError(w, http.StatusInternalServerError, "Failed to read body", "POST", "/transfers")
+		return
+	}
+
+	// Create Hash for Idempotency check
 	hash := sha256.Sum256(body)
 	reqHash := hex.EncodeToString(hash[:])
+
+	// Re-populate body for decoder
 	r.Body = io.NopCloser(bytes.NewBuffer(body))
 
 	var req domain.TransferRequest
@@ -60,7 +68,6 @@ func (h *Handler) CreateTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validation
 	if req.Amount <= 0 {
 		h.respondError(w, http.StatusUnprocessableEntity, "Amount must be positive", "POST", "/transfers")
 		return
@@ -72,34 +79,36 @@ func (h *Handler) CreateTransfer(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := h.store.ExecTransfer(r.Context(), req, idemKey, reqHash)
 	if err != nil {
-		if err == store.ErrConflict {
-			h.respondError(w, http.StatusConflict, "Request in progress", "POST", "/transfers")
-			return
-		}
-		if err == store.ErrAccountNotFound {
+		switch err {
+		case store.ErrConflict:
+			h.respondError(w, http.StatusConflict, "Request in progress or lock contention", "POST", "/transfers")
+		case store.ErrAccountNotFound:
 			h.respondError(w, http.StatusNotFound, "Account not found", "POST", "/transfers")
-			return
-		}
-		if err.Error() == "idempotency key mismatch" {
-			h.respondError(w, http.StatusUnprocessableEntity, "Key reuse mismatch", "POST", "/transfers")
-			return
-		}
-		if err.Error() == "insufficient funds" {
+		case store.ErrKeyMismatch:
+			h.respondError(w, http.StatusUnprocessableEntity, "Idempotency key reused with different payload", "POST", "/transfers")
+		case store.ErrFunds:
 			h.respondError(w, http.StatusUnprocessableEntity, "Insufficient funds", "POST", "/transfers")
-			return
+		default:
+			h.respondError(w, http.StatusInternalServerError, err.Error(), "POST", "/transfers")
 		}
-		h.respondError(w, http.StatusInternalServerError, err.Error(), "POST", "/transfers")
 		return
 	}
 
-	// Detect if this was a new creation or a replay. In a real system we'd check the store result details.
-	// For simplicity, we assume 201, but the client handles 200/201 identically usually.
 	w.Header().Set("Location", fmt.Sprintf("/transfers/%d", resp.Transfer.ID))
+	// In a real scenario, we might return 200 for replays and 201 for creations,
+	// but the payload handles the differentiation.
 	h.respondJSON(w, http.StatusCreated, resp, "POST", "/transfers")
 }
 
 func (h *Handler) CreateAccount(w http.ResponseWriter, r *http.Request) {
-	id, err := h.store.CreateAccount(r.Context(), 0)
+	// Simplified handler for seeding
+	type req struct {
+		InitialBalance int64 `json:"initial_balance"`
+	}
+	var p req
+	json.NewDecoder(r.Body).Decode(&p)
+
+	id, err := h.store.CreateAccount(r.Context(), p.InitialBalance)
 	if err != nil {
 		h.respondError(w, http.StatusInternalServerError, err.Error(), "POST", "/accounts")
 		return
@@ -108,22 +117,21 @@ func (h *Handler) CreateAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetAccount(w http.ResponseWriter, r *http.Request) {
-	idStr := mux.Vars(r)["id"]
-	id, _ := strconv.ParseInt(idStr, 10, 64)
+	vars := mux.Vars(r)
+	id, _ := strconv.ParseInt(vars["id"], 10, 64)
 
 	acc, err := h.store.GetAccount(r.Context(), id)
 	if err != nil {
 		if err == store.ErrAccountNotFound {
-			h.respondError(w, http.StatusNotFound, "Not Found", "GET", "/accounts/{id}")
+			h.respondError(w, http.StatusNotFound, "Account not found", "GET", "/accounts")
 			return
 		}
-		h.respondError(w, http.StatusInternalServerError, err.Error(), "GET", "/accounts/{id}")
+		h.respondError(w, http.StatusInternalServerError, err.Error(), "GET", "/accounts")
 		return
 	}
-	h.respondJSON(w, http.StatusOK, acc, "GET", "/accounts/{id}")
+	h.respondJSON(w, http.StatusOK, acc, "GET", "/accounts")
 }
 
-// Helpers
 func (h *Handler) respondJSON(w http.ResponseWriter, code int, payload interface{}, method, endpoint string) {
 	httpReqTotal.WithLabelValues(method, endpoint, strconv.Itoa(code)).Inc()
 	w.Header().Set("Content-Type", "application/json")

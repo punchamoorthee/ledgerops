@@ -8,6 +8,7 @@ import (
 type Config struct {
 	DBSource string
 	Port     string
+	Env      string
 }
 
 func Load() (*Config, error) {
@@ -21,8 +22,14 @@ func Load() (*Config, error) {
 		port = "8080"
 	}
 
+	env := os.Getenv("ENVIRONMENT")
+	if env == "" {
+		env = "development"
+	}
+
 	return &Config{
 		DBSource: dbSource,
 		Port:     port,
+		Env:      env,
 	}, nil
 }

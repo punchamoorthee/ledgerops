@@ -1,9 +1,11 @@
+-- Accounts Table
 CREATE TABLE "accounts" (
   "id" bigserial PRIMARY KEY,
   "balance" bigint NOT NULL DEFAULT 0 CHECK (balance >= 0),
   "created_at" timestamptz NOT NULL DEFAULT (now())
 );
 
+-- Transfers Table (Represents the Intent)
 CREATE TABLE "transfers" (
   "id" bigserial PRIMARY KEY,
   "from_account_id" bigint NOT NULL REFERENCES "accounts" ("id"),
@@ -13,6 +15,7 @@ CREATE TABLE "transfers" (
   "created_at" timestamptz NOT NULL DEFAULT (now())
 );
 
+-- Ledger Entries (Represents the Immutable Reality)
 CREATE TABLE "ledger_entries" (
   "id" bigserial PRIMARY KEY,
   "transfer_id" bigint NOT NULL REFERENCES "transfers" ("id") ON DELETE CASCADE,
@@ -21,6 +24,7 @@ CREATE TABLE "ledger_entries" (
   "created_at" timestamptz NOT NULL DEFAULT (now())
 );
 
+-- Idempotency Keys (Represents Request State)
 CREATE TABLE "idempotency_keys" (
   "key" text PRIMARY KEY,
   "request_hash" text NOT NULL,
@@ -31,16 +35,19 @@ CREATE TABLE "idempotency_keys" (
   "created_at" timestamptz NOT NULL DEFAULT (now())
 );
 
--- Invariant Trigger
+-- INVARIANT ENFORCEMENT
+-- This function ensures that money is never created or destroyed.
+-- The sum of deltas for any transfer must equal zero.
 CREATE OR REPLACE FUNCTION check_ledger_invariant() RETURNS TRIGGER AS $$
 BEGIN
   IF (SELECT SUM(delta) FROM ledger_entries WHERE transfer_id = NEW.transfer_id) <> 0 THEN
-    RAISE EXCEPTION 'Ledger invariant violated: SUM(delta) <> 0';
+    RAISE EXCEPTION 'Ledger invariant violated: SUM(delta) <> 0 for transfer %', NEW.transfer_id;
   END IF;
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
+-- Trigger is DEFERRED to allow inserting both debit and credit before checking.
 CREATE CONSTRAINT TRIGGER check_invariant_trigger
 AFTER INSERT ON ledger_entries
 DEFERRABLE INITIALLY DEFERRED

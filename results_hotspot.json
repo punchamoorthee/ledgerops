@@ -1,1 +1,1 @@
-{"abort_rate_pct":60.98853868194843,"aborts_conflict":4257,"duration_sec":30.323478205,"errors":422,"success_created":2301,"success_replay":0,"throughput_tps":230.18467580836673,"total_requests":6980,"workload":"hotspot"}
+{"abort_rate_pct":66.54275092936803,"aborts_conflict":4117,"duration_sec":30.12994903,"errors":787,"success_created":1283,"success_replay":0,"throughput_tps":205.34385882431081,"total_requests":6187,"workload":"hotspot"}
