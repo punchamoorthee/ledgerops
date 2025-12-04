@@ -30,7 +30,7 @@ func main() {
 
 	log.Println("--- Seeding Database ---")
 
-	// 1. Clean Slate (Optional: dangerous in prod, useful for bench)
+	// 1. Clean Slate (Optional: dangerous in production, useful for benchmarking)
 	// _, err = conn.Exec(ctx, "TRUNCATE TABLE accounts, transfers, ledger_entries, idempotency_keys CASCADE")
 	// if err != nil { log.Fatal(err) }
 
@@ -42,7 +42,7 @@ func main() {
 		return
 	}
 
-	// 3. Bulk Insert using CopyFrom (Fastest method)
+	// 3. Bulk Insert using CopyFrom
 	log.Printf("Generating %d accounts...", TotalAccounts)
 	rows := [][]interface{}{}
 	for i := 0; i < TotalAccounts; i++ {

@@ -79,7 +79,7 @@ func (s *LedgerStore) ExecTransfer(ctx context.Context, req domain.TransferReque
 	}
 
 	// --- 2. DETERMINISTIC LOCKING ---
-	// Sort IDs to prevent circular wait conditions (Deadlock Freedom)
+	// Sort IDs to prevent circular wait conditions
 	first, second := req.FromAccountID, req.ToAccountID
 	if first > second {
 		first, second = second, first

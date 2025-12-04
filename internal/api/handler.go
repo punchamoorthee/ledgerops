@@ -101,7 +101,6 @@ func (h *Handler) CreateTransfer(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) CreateAccount(w http.ResponseWriter, r *http.Request) {
-	// Simplified handler for seeding
 	type req struct {
 		InitialBalance int64 `json:"initial_balance"`
 	}
