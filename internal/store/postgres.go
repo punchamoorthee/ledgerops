@@ -41,7 +41,6 @@ func (s *LedgerStore) GetAccount(ctx context.Context, id int64) (*domain.Account
 }
 
 func (s *LedgerStore) GetEntries(ctx context.Context, accountID int64) ([]domain.LedgerEntry, error) {
-	// First check existence
 	var exists bool
 	_ = s.db.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM accounts WHERE id=$1)", accountID).Scan(&exists)
 	if !exists {
@@ -64,7 +63,6 @@ func (s *LedgerStore) GetEntries(ctx context.Context, accountID int64) ([]domain
 	return entries, nil
 }
 
-// ExecTransfer implements the Core Transactional Logic
 func (s *LedgerStore) ExecTransfer(ctx context.Context, req domain.TransferRequest, idempotencyKey, reqHash string) (*domain.TransferResponse, error) {
 	// Start Tx with Repeatable Read
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
@@ -82,19 +80,17 @@ func (s *LedgerStore) ExecTransfer(ctx context.Context, req domain.TransferReque
 		Scan(&storedStatus, &storedBody, &storedHash)
 
 	if err == nil {
-		// Key Found
 		if storedHash != reqHash {
 			return nil, fmt.Errorf("idempotency key mismatch")
 		}
 		if storedStatus == "in_progress" {
 			return nil, ErrConflict
 		}
-		// Return cached response
 		var resp domain.TransferResponse
 		if err := json.Unmarshal(storedBody, &resp); err != nil {
 			return nil, err
 		}
-		return &resp, nil // 200 OK replay
+		return &resp, nil
 	} else if err != pgx.ErrNoRows {
 		return nil, err
 	}
@@ -115,11 +111,16 @@ func (s *LedgerStore) ExecTransfer(ctx context.Context, req domain.TransferReque
 		first, second = second, first
 	}
 
-	// Using Exec to lock rows, just checking existence effectively while locking
-	// We read balance later, but locking explicitly first is cleaner for deadlock prevention
+	// UPDATED: Use NOWAIT to fail fast during contention
 	for _, id := range []int64{first, second} {
 		var b int64
-		if err := tx.QueryRow(ctx, "SELECT balance FROM accounts WHERE id = $1 FOR UPDATE", id).Scan(&b); err != nil {
+		// We use NOWAIT here. If locked, Postgres returns code 55P03
+		if err := tx.QueryRow(ctx, "SELECT balance FROM accounts WHERE id = $1 FOR UPDATE NOWAIT", id).Scan(&b); err != nil {
+			var pgErr *pgconn.PgError
+			// 55P03 is lock_not_available
+			if errors.As(err, &pgErr) && pgErr.Code == "55P03" {
+				return nil, ErrConflict
+			}
 			return nil, ErrAccountNotFound
 		}
 	}
@@ -156,7 +157,7 @@ func (s *LedgerStore) ExecTransfer(ctx context.Context, req domain.TransferReque
 		return nil, err
 	}
 
-	// 6. Finalize Response & Idempotency
+	// 6. Finalize
 	resp := domain.TransferResponse{
 		Transfer: domain.Transfer{ID: transferID, FromAccountID: req.FromAccountID, ToAccountID: req.ToAccountID, Amount: req.Amount, Status: "completed"},
 		Entries:  []domain.LedgerEntry{{AccountID: req.FromAccountID, Delta: -req.Amount}, {AccountID: req.ToAccountID, Delta: req.Amount}},
